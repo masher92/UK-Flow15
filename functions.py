@@ -2,14 +2,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
+def load_station_data(station_id: str) -> pd.DataFrame:
+    url = f"https://catalogue.ceh.ac.uk/datastore/eidchub/211710ac-f01b-4b52-807f-373babb1c368/1_RiverFlowStations/{station_id}.csv"
+    return pd.read_csv(url, parse_dates=["datetime"], index_col="datetime")
+
 def explore_qc_flags(
     df: pd.DataFrame,
     station_id: str,
     print_summary_table : bool = False,
     qc_columns: list = [0, 1, 2],
-    qc_flags: list = ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
-    
-):
+    qc_flags: list = ["1", "2", "3", "4", "5", "6", "7", "8", "9"],):
     """
     Explore how many timesteps would be flagged for each combination of
     qc_column and qc_flag value, to inform selection before running interpolation.
@@ -110,7 +112,6 @@ def plot_qc_flag_distribution(
     Plot the distribution of flagged timestamps across the full record,
     with a separate row for each QC column so it is easy to see whether
     the three checks flag the same periods or different ones.
-
     Parameters
     ----------
     df : pd.DataFrame
@@ -166,8 +167,7 @@ def plot_qc_flag_distribution(
     axes[-1].set_xlabel("Datetime")
     fig.suptitle(f"Station {station_id} — Distribution of flagged timestamps by QC column", y=1.02)
     plt.tight_layout()
-    plt.show()
-
+    return fig
 
 def plot_flagged_clusters(
     df: pd.DataFrame,
@@ -339,6 +339,77 @@ def normalize_flag_to_3char(flag_series: pd.Series) -> pd.Series:
     nums = pd.to_numeric(flag_series, errors="coerce").fillna(0).astype(int)
     return nums.astype(str).str.zfill(3)
 
+def run_interpolation(df, flagged_rows, station_id, round_decimals=2):
+    # =============================================================================
+    # STEP 1: PREPARE THE DATA FOR INTERPOLATION
+    # =============================================================================
+    # Time-based interpolation requires the data to be sorted chronologically
+    # and for each timestamp to appear only once. If duplicate timestamps exist,
+    # we collapse them by taking the mean, since interpolation cannot handle
+    # multiple values at the same point in time.
+
+    df = df.sort_index()
+    if not df.index.is_unique:
+        df = df.groupby(level=0).mean(numeric_only=True)
+        
+    # Recompute the mask against the now-sorted index
+    flagged_rows = flagged_rows.reindex(df.index, fill_value=False)        
+        
+    # =============================================================================
+    # STEP 2: RECORD THE ORIGINAL VALUES BEFORE INTERPOLATION
+    # =============================================================================
+    # Before we overwrite any values, we save the original values of the flagged
+    # rows. This gives us a log of what changed, which is useful for auditing
+    # and quality checking the interpolation afterwards.    
+
+    old_values = (
+        df.loc[flagged_rows, ["value"]]
+        .rename(columns={"value": "old_value"})
+        .reset_index()
+    )
+
+    # =============================================================================
+    # STEP 3: REPLACE FLAGGED VALUES WITH INTERPOLATED ESTIMATES
+    # =============================================================================
+    # We set the flagged values to NaN (null), then use time-based linear
+    # interpolation to estimate replacement values. Unlike simple positional
+    # interpolation, time-based interpolation accounts for uneven gaps between
+    # timestamps — so a 6-hour gap is treated differently to a 1-hour gap.
+    
+    df.loc[flagged_rows, "value"] = pd.NA
+    df["value"] = df["value"].interpolate(method="time")
+
+    if (round_decimals is not None) and (round_decimals >= 0):
+        df["value"] = df["value"].round(round_decimals)
+
+    # =============================================================================
+    # STEP 4: BUILD THE INTERPOLATION LOG
+    # =============================================================================
+    # Finally, we combine the original values (saved in Step 3) with the new
+    # interpolated values to produce a log of every change made. This log can
+    # be saved to a CSV for auditing purposes.
+
+    old_values["new_value"] = old_values["datetime"].map(df["value"])
+    old_values["station"] = station_id
+    interp_log = old_values[["station", "datetime", "old_value", "new_value"]]
+    print("\nInterpolation log (old vs new values):")
+    print(interp_log.head(10))
+
+    # =============================================================================
+    # CHECK: IDENTIFY POINTS THAT COULD NOT BE INTERPOLATED
+    # =============================================================================
+    # Time-based interpolation cannot fill values at the edges of the record
+    # where there is no preceding or following real value to interpolate from.
+    # These will remain as NaN in the cleaned data.
+
+    unresolved = interp_log[interp_log["new_value"].isna()]
+    if not unresolved.empty:
+        print(f"Warning: {len(unresolved)} point(s) could not be interpolated.")
+    else:
+        print("All flagged points were successfully interpolated.")
+
+    return interp_log, unresolved, df
+
 
 def build_qc_mask(flag_str_series: pd.Series, qc_column: int, qc_flags: str) -> pd.Series:
     """
@@ -392,3 +463,86 @@ def group_consecutive_times(times: pd.DatetimeIndex, expected_delta: pd.Timedelt
     runs.append((run_start, prev))
     return runs
 
+
+
+####################### VISUAL REVIEW FUNCTIONS
+# # --- Functions ---
+# def show_event(idx, current_out, station_id, df, runs_list, btn_back ):
+#     current_out.clear_output()
+
+#     start, end = runs_list[idx]
+#     window = df.loc[start - pd.Timedelta(days=1): end + pd.Timedelta(days=1), "value"]
+
+#     with current_out:
+#         fig, ax = plt.subplots(figsize=(10, 4))
+#         ax.plot(window.index, window.values, lw=1)
+#         ax.axvspan(start, end, color="red", alpha=0.3)
+#         ax.set_title(
+#             f"{station_id} ({idx+1}/{len(runs_list)}) — "
+#             f"{start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M}")
+#         plt.tight_layout()
+#         plt.show()
+
+#     btn_back.disabled = (idx == 0)
+
+
+# def update_progress():
+#     progress.value = len(all_results)
+
+
+# def log_result(text):
+#     with history_out:
+#         print(text)
+
+
+# def next_event():
+#     global i
+#     i += 1
+#     if i < len(runs_list):
+#         show_event(i)
+#     else:
+#         current_out.clear_output()
+#         with history_out:
+#             print("🎉 Done!")
+
+
+# def prev_event():
+#     global i
+
+#     if i > 0:
+#         i -= 1
+
+#         if len(all_results) > i:
+#             all_results.pop()
+
+#         update_progress()
+#         show_event(i)
+
+#         with history_out:
+#             print(f"↩️ Went back to event {i+1}")
+
+
+# def on_true(b):
+#     start, end = runs_list[i]
+
+#     if len(all_results) > i:
+#         all_results[i] = {"station": station_id, "start": start, "end": end, "real": True}
+#     else:
+#         all_results.append({"station": station_id, "start": start, "end": end, "real": True})
+
+#     log_result(f"✅ {i+1}: {start} – {end} → True")
+#     update_progress()
+#     next_event()
+
+
+def on_false(b):
+    start, end = runs_list[i]
+
+    if len(all_results) > i:
+        all_results[i] = {"station": station_id, "start": start, "end": end, "real": False}
+    else:
+        all_results.append({"station": station_id, "start": start, "end": end, "real": False})
+
+    log_result(f"❌ {i+1}: {start} – {end} → False")
+    update_progress()
+    next_event()
