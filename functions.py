@@ -233,17 +233,15 @@ def plot_qc_flag_distribution(df: pd.DataFrame, station_id: str,
 
     return fig, flagged
 
-def find_runs (df, station_id, qc_col_idx, qc_flag):
+def find_runs (df, station_id, qc_col_name, qc_flag):
     
     flag_padded = normalize_flag_to_3char(df["flag"])
-    col_names = {0: "X", 1: "Y", 2: "Z"}
-    col_name = col_names[qc_col_idx]
 
     # Extract all digit positions in one pass
     digits = pd.DataFrame({"X": flag_padded.str[0],"Y": flag_padded.str[1],"Z": flag_padded.str[2],})
 
     # Find timestamps where this column has a flagged value
-    flagged_mask = digits[col_name] == qc_flag
+    flagged_mask = digits[qc_col_name] == qc_flag
     flagged_timestamps = df.index[flagged_mask]
     
     # New run starts wherever the mask value changes
@@ -259,6 +257,38 @@ def find_runs (df, station_id, qc_col_idx, qc_flag):
     
     return flagged_runs, df
 
+
+def plot_spikes(run_data, df, annotate_high_vals= True, pad = pd.Timedelta("1D")):
+    
+    t0 = run_data["start"].min() - pad
+    t1 = run_data["end"].max() + pad
+    window = df.loc[t0:t1]
+    flagged_in_window = window[df['flagged_mask'].loc[window.index]]
+
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(window.index, window["value"], "-o", ms=1, lw=0.8, color="0.3")
+    ax.plot(flagged_in_window.index, flagged_in_window["value"], "o", ms=2,
+            color="red",
+            label=f"flagged samples (n={len(flagged_in_window)}, {len(run_data)} runs)")
+
+    for r in run_data.itertuples():
+
+        vals = window.loc[r.start:r.end, "value"]
+        lo, hi = vals.min(), vals.max()
+        text = f"{hi:.3g}" if np.isclose(lo, hi) else f"{lo:.3g}–{hi:.3g}"
+
+        ax.annotate(text,
+                    xy=(r.start + (r.end - r.start) / 2, hi),
+                    xytext=(0, 6), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=7, color="red")
+
+    ax.margins(y=0.15)  # headroom so labels aren't clipped
+    ax.set_title(f"Flagged periods: {t0:%Y-%m-%d} to {t1:%Y-%m-%d}")
+    ax.set_ylabel("value")
+    ax.legend(loc="upper right")
+    plt.show()
+    return fig
+
 def plot_run(runs, df, cluster_id, pad = pd.Timedelta("1D")):
     
     run_data = runs[runs["cluster"] == cluster_id]
@@ -266,7 +296,7 @@ def plot_run(runs, df, cluster_id, pad = pd.Timedelta("1D")):
     t0 = run_data["start"].min() - pad
     t1 = run_data["end"].max() + pad
     window = df.loc[t0:t1]
-    #flagged_in_window = window[flagged_mask.loc[window.index]]
+
     flagged_in_window = window[df['flagged_mask'].loc[window.index]]
 
     fig, ax = plt.subplots(figsize=(10, 3))
@@ -451,57 +481,6 @@ def explore_qc_flags(
 
     return summary
 
-# def plot_qc_flag_distribution(df: pd.DataFrame, station_id: str, qc_columns: list = [0, 1, 2],
-#     qc_flags: list = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]):
-    
-#     """
-#     Plot the distribution of flagged timestamps across the full record,
-#     with a separate row for each QC column so it is easy to see whether
-#     the three checks flag the same periods or different ones.
-#     Parameters
-#     ----------
-#     df : pd.DataFrame
-#         The dataframe with datetime index and 'flag' column.
-#     station_id : str
-#         Station ID, used in plot title.
-#     qc_columns : list
-#         Which QC digit positions to plot (0=X, 1=Y, 2=Z). Default is all three.
-#     qc_flags : list
-#         Which digit values to treat as flagged. Default is 1-9.
-#     """
-
-#     flag_padded = normalize_flag_to_3char(df["flag"])
-#     col_names = {0: "X", 1: "Y", 2: "Z"}
-#     colours = {0: "steelblue", 1: "firebrick", 2: "seagreen"}
-
-#     # Extract all digit positions in one pass
-#     digits = pd.DataFrame({"X": flag_padded.str[0],"Y": flag_padded.str[1],"Z": flag_padded.str[2],})
-
-#     fig, axes = plt.subplots(len(qc_columns), 1,figsize=(14, len(qc_columns) * 1.5), sharex=True)
-
-#     # Handle case where only one column is requested
-#     if len(qc_columns) == 1:
-#         axes = [axes]
-
-#     for ax, col_idx in zip(axes, qc_columns):
-#         col_name = col_names[col_idx]
-
-#         # Find timestamps where this column has a flagged value
-#         flagged_mask = digits[col_name].isin(qc_flags)
-#         flagged_timestamps = df.index[flagged_mask]
-
-#         ax.axhspan(0, 1, color="lightgrey", alpha=0.3)
-#         ax.vlines(flagged_timestamps,ymin=0, ymax=1,color=colours[col_idx],linewidth=0.5, alpha=0.7)
-
-#         ax.set_yticks([])
-#         ax.set_ylabel(f"{col_idx} ({col_name})", rotation=0, labelpad=40, va="center")
-#         ax.set_title(f"{flagged_mask.sum()} flagged timesteps", fontsize=9, loc="right")
-
-#     axes[-1].set_xlabel("Datetime")
-#     fig.suptitle(f"Station {station_id} — Distribution of flagged timestamps by QC column", y=1.02)
-#     plt.tight_layout()
-#     return fig, flagged_timestamps
-
 def plot_flagged_clusters(
     df: pd.DataFrame,
     clusters: list,
@@ -646,12 +625,6 @@ def find_truncated_flows(
     # A run continues if value is unchanged AND there's no time gap
     step = t.diff().median()
     contiguous = (t.diff().iloc[1:] <= 1.5 * step).to_numpy()
-#     same = np.abs(np.diff(v)) <= tol
-#     new_run = np.ones(len(d), bool)
-#     new_run[1:] = ~(same & contiguous)
-#     d["run"] = np.cumsum(new_run)
-#     d["i"] = np.arange(len(d))
-    
     
     run_id = np.zeros(len(v), int)
     anchor, r = v[0], 0
